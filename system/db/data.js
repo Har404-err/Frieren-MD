@@ -59,11 +59,23 @@ let premiumData = loadSync(premiumPath);
 // --- FUNGSI INTI BARU DENGAN LOWDB ---
 const db = () => dbs.database.data
 const gc = () => dbs.dataGc.data
-const stats = () => dbs.stats?.data || {} // New Stats DB
-const requests = () => dbs.requests?.data || { key: {} } 
+const stats = () => dbs.stats?.data || {}
+const requests = () => dbs.requests?.data || { key: {} }
+const lid = () => dbs.lid?.data || { key: {} }
 const badwords = () => badwordsData
 const blacklist = () => blacklistData
 const premiumList = () => premiumData
+
+let dirtyFlags = { database: false, stats: false, requests: false, dataGc: false, lid: false }
+
+function markDirty(type = 'database') {
+    if (Object.prototype.hasOwnProperty.call(dirtyFlags, type)) {
+        dirtyFlags[type] = true
+    } else {
+        dirtyFlags.database = true
+    }
+    saveDbDebounced()
+}
 
 const getGc = chat => {
     const id = typeof chat === 'object' ? chat.id : chat
@@ -81,15 +93,20 @@ const saveDbDebounced = () => {
 
 const saveDb = async () => {
     if (dbs.database) await dbs.database.write()
-    if (dbs.stats) await dbs.stats.write() // Save Stats
-    if (dbs.requests) await dbs.requests.write() // Save Requests
-    if (dbs.dataGc) await dbs.dataGc.write() // Save Groups
+    if (dbs.stats) await dbs.stats.write()
+    if (dbs.requests) await dbs.requests.write()
+    if (dbs.lid) await dbs.lid.write()
+    if (dbs.dataGc) await dbs.dataGc.write()
+    
+    // Reset dirty flags after save
+    dirtyFlags = { database: false, stats: false, requests: false, dataGc: false, lid: false }
     
     if (mongoDB.db) {
         await mongoDB.botData.set('database', db())
         if (dbs.stats) await mongoDB.botData.set('stats', stats())
         if (dbs.requests) await mongoDB.botData.set('requests', requests())
-        await mongoDB.botData.set('dataGc', gc()) // Save Groups
+        if (dbs.lid) await mongoDB.botData.set('lid', lid())
+        await mongoDB.botData.set('dataGc', gc())
     }
 }
 
@@ -323,6 +340,7 @@ export {
   gc,
   stats,
   requests,
+  lid,
   getGc,
   saveDb,
   saveDbDebounced,
@@ -337,5 +355,6 @@ export {
   randomId,
   authUser,
   authGc,
-  syncWithMongo
+  syncWithMongo,
+  markDirty
 }

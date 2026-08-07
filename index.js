@@ -50,6 +50,7 @@ const tempDir = path.join(__dirname, 'temp')
 fs.existsSync(tempDir) || fs.mkdirSync(tempDir, { recursive: !0 })
 
 global.lidCache = {}
+global.lidReverseMap = new Map()
 global.msgCache = {}
 const logLevel = pino({ level: 'silent' })
 let xp

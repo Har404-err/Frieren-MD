@@ -1,5 +1,6 @@
 import crypto from 'crypto'
 import fetch from 'node-fetch'
+import fs from 'fs'
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 const { prepareWAMessageMedia, generateWAMessageFromContent, generateWAMessage, proto } = require('@adiwajshing/baileys');
@@ -21,7 +22,7 @@ async function _imgTmp() {
   if (!img || imgCache.url) {
     if (!img) return
 
-    const res = imgCache.url ? await fetch(imgCache.url,{method:'HEAD'}).catch(_=>!1) : null
+    const res = imgCache.url ? await fetch(imgCache.url,{method:'HEAD'}).catch(() => !1) : null
     if (res && res.ok) return imgCache.url
     if (imgCache.url) delete imgCache.url
   }
@@ -54,44 +55,46 @@ async function getMetadata(id, xp, retry = 2) {
 }
 
 async function saveLidCache(metadata) {
-  if (!global.lidCache) global.lidCache = {}
+  if (!global.lidReverseMap) global.lidReverseMap = new Map()
   for (const p of metadata?.participants || []) {
-    const phone = p.id?.split('@')[0]
-    const lid = p.lid || (p.id?.endsWith('@lid') ? p.id : null)
+    const lidId = p.lid || (p.id?.endsWith('@lid') ? p.id : null)
+    const pnJid = p.phoneNumber || p.pnJid || (p.id?.endsWith('@s.whatsapp.net') ? p.id : null)
     
-    if (phone && lid && !p.id?.endsWith('@lid')) {
-        global.lidCache[phone] = lid
+    if (lidId && pnJid) {
+      global.lidReverseMap.set(lidId, pnJid)
     }
   }
 }
 
-function replaceLid(o, v = new WeakSet()) {
-  if (!o) return o
-  if (typeof o == "object") {
-    if (v.has(o)) return o
-    v.add(o)
-    if (Array.isArray(o)) return o.map(i => replaceLid(i, v))
-    if (Buffer.isBuffer(o) || o instanceof Uint8Array) return o
-    for (const k in o) o[k] = replaceLid(o[k], v)
-    return o
+function replaceLid(m) {
+  if (!m || !global.lidReverseMap) return m
+  
+  const resolveLidMentions = (text) => {
+    if (typeof text !== 'string') return text
+    return text.replace(/@(\d+)@lid/g, (_, num) => {
+      const resolved = global.lidReverseMap.get(`${num}@lid`)
+      return resolved ? `@${resolved.split('@')[0]}` : `@${num}@lid`
+    })
   }
-  if (typeof o == "string") {
-    const e = Object.entries(global.lidCache ?? {})
-    if (/@lid$/.test(o)) {
-      const p = e.find(([, v]) => v === o)?.[0]
-      if (p) return `${p}@s.whatsapp.net`
-    }
-    return o
-      .replace(/@(\d+)@lid/g, (_, i) => {
-        const p = e.find(([, v]) => v === `${i}@lid`)?.[0]
-        return p ? `@${p}` : `@${i}@lid`
-      })
-      .replace(/@(\d+)(?!@)/g, (m, l) => {
-        const p = e.find(([, v]) => v === `${l}@lid`)?.[0]
-        return p ? `@${p}` : m
-      })
+
+  // Handle message text fields
+  if (m.message?.extendedTextMessage?.text) {
+    m.message.extendedTextMessage.text = resolveLidMentions(m.message.extendedTextMessage.text)
   }
-  return o
+  if (m.message?.conversation) {
+    m.message.conversation = resolveLidMentions(m.message.conversation)
+  }
+  // Handle caption fields
+  if (m.message?.imageMessage?.caption) {
+    m.message.imageMessage.caption = resolveLidMentions(m.message.imageMessage.caption)
+  }
+  if (m.message?.videoMessage?.caption) {
+    m.message.videoMessage.caption = resolveLidMentions(m.message.videoMessage.caption)
+  }
+  if (m.message?.documentMessage?.caption) {
+    m.message.documentMessage.caption = resolveLidMentions(m.message.documentMessage.caption)
+  }
+  return m
 }
 
 async function call(xp, error, m) {

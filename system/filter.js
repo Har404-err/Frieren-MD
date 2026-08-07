@@ -12,23 +12,19 @@ export const checkAutoDelete = async (m, xp) => {
     try {
         if (!fs.existsSync(autodelPath)) return
         
-        const sender = m.key.participant || m.key.remoteJid
+        const sender = m.sender || m.key?.participant || m.key?.remoteJid
         const list = JSON.parse(fs.readFileSync(autodelPath))
         
         // Cek apakah sender ada di list
         const isTarget = list.some(id => id.split('@')[0] === sender.split('@')[0])
         
         if (isTarget) {
-            // Jika di grup, bot harus admin
-            if (m.key.remoteJid.endsWith('@g.us')) {
-                const { botAdm } = await grupify(xp, m.key.remoteJid, sender)
+            const chatId = m.chat || m.key?.remoteJid
+            if (m.isGroup || chatId?.endsWith('@g.us')) {
+                const { botAdm } = await grupify(xp, chatId, sender)
                 if (botAdm) {
-                    await xp.sendMessage(m.key.remoteJid, { delete: m.key })
+                    await xp.sendMessage(chatId, { delete: m.key })
                 }
-            } else {
-                // Private chat (Bot selalu bisa delete pesan user? Tidak, hanya pesan bot sendiri)
-                // Tapi untuk 'clear chat' effect, bot mungkin tidak bisa delete pesan masuk di PC kecuali block.
-                // Jadi fitur ini lebih efektif di GRUP.
             }
         }
     } catch (e) {
@@ -38,27 +34,34 @@ export const checkAutoDelete = async (m, xp) => {
 
 export const checkToxic = async (m, xp) => {
   try {
-    if (!m.key.remoteJid.endsWith('@g.us')) return // Hanya grup
+    const chatId = m.chat || m.key?.remoteJid
+    if (!m.isGroup && !chatId?.endsWith('@g.us')) return
     
-    const gcData = getGc({ id: m.key.remoteJid })
-    if (!gcData || !gcData.filter?.antitoxic) return // Fitur tidak aktif
+    const gcData = getGc({ id: chatId })
+    if (!gcData || !gcData.filter?.antitoxic) return
     
-    const text = (m.message?.conversation || m.message?.extendedTextMessage?.text || '').toLowerCase()
+    const text = (m.text || m.body || '').toLowerCase()
     if (!text) return
 
-    const isToxic = badwords().some(word => text.includes(word.toLowerCase())) || (gcData.badwords || []).some(word => text.includes(word.toLowerCase()))
+    const sender = m.sender || m.key?.participant || m.key?.remoteJid
+    const cleanText = text.replace(/[^\w\s]/g, '')
+    
+    const isToxic = badwords().some(word => {
+        const pattern = new RegExp(`\\b${word.toLowerCase()}\\b`, 'i')
+        return pattern.test(text) || pattern.test(cleanText) || text.includes(word.toLowerCase())
+    }) || (gcData.badwords || []).some(word => {
+        const pattern = new RegExp(`\\b${word.toLowerCase()}\\b`, 'i')
+        return pattern.test(text) || pattern.test(cleanText) || text.includes(word.toLowerCase())
+    })
     if (!isToxic) return
 
-    // Cek apakah bot admin (biar bisa hapus)
-    const { botAdm } = await grupify(xp, m.key.remoteJid, m.key.participant || m.key.remoteJid)
-    
-    // Admin dan Owner TIDAK KEBAL (sesuai request)
-    // if (usrAdm) return 
+    const { botAdm } = await grupify(xp, chatId, sender)
 
     if (botAdm) {
-        await xp.sendMessage(m.key.remoteJid, { delete: m.key })
-        await xp.sendMessage(m.key.remoteJid, { text: `⚠️ @${m.key.participant.split('@')[0]} terdeteksi toxic! Pesan dihapus.`, mentions: [m.key.participant] })
+        await xp.sendMessage(chatId, { delete: m.key })
+        await xp.sendMessage(chatId, { text: `⚠️ @${sender.split('@')[0]} terdeteksi toxic! Pesan dihapus.`, mentions: [sender] })
     }
+    return isToxic ? true : undefined
 
   } catch (e) {
     console.error('Error checkToxic:', e)
@@ -67,27 +70,25 @@ export const checkToxic = async (m, xp) => {
 
 export const checkVirtext = async (m, xp) => {
   try {
-    if (!m.key.remoteJid.endsWith('@g.us')) return // Hanya grup
+    const chatId = m.chat || m.key?.remoteJid
+    if (!m.isGroup && !chatId?.endsWith('@g.us')) return
     
-    const text = m.message?.conversation || m.message?.extendedTextMessage?.text || ''
+    const text = m.text || m.body || ''
     if (!text) return
 
-    // Batas 50000 karakter (Indikasi Virtext/Spam Ekstrim)
     if (text.length > 50000) {
-        const { botAdm, usrAdm } = await grupify(xp, m.key.remoteJid, m.key.participant || m.key.remoteJid)
-        
-        // Jangan tindak admin
+        const sender = m.sender || m.key?.participant || m.key?.remoteJid
+        const { botAdm, usrAdm } = await grupify(xp, chatId, sender)
         if (usrAdm) return 
 
         if (botAdm) {
-            // Hanya Hapus Pesan (Tanpa Kick)
-            await xp.sendMessage(m.key.remoteJid, { delete: m.key })
-            
-            await xp.sendMessage(m.key.remoteJid, { 
-                text: `⚠️ *SPAM DETECTED* ⚠️\n\n@${m.key.participant.split('@')[0]} pesanmu dihapus karena terlalu panjang (> 50.000 karakter).`,
-                mentions: [m.key.participant]
+            await xp.sendMessage(chatId, { delete: m.key })
+            await xp.sendMessage(chatId, { 
+                text: `⚠️ *SPAM DETECTED* ⚠️\n\n@${sender.split('@')[0]} pesanmu dihapus karena terlalu panjang (> 50.000 karakter).`,
+                mentions: [sender]
             })
         }
+        return true
     }
   } catch (e) {
     console.error('Error checkVirtext:', e)
@@ -96,30 +97,25 @@ export const checkVirtext = async (m, xp) => {
 
 export const checkSpamTag = async (m, xp) => {
   try {
-    if (!m.key.remoteJid.endsWith('@g.us')) return // Hanya grup
+    const chatId = m.chat || m.key?.remoteJid
+    if (!m.isGroup && !chatId?.endsWith('@g.us')) return
     
-    // Cek Mentions
-    const mentions = m.message?.extendedTextMessage?.contextInfo?.mentionedJid || []
+    const mentions = m.mentionedJid || []
     
-    // Batas Max Tag: 10
     if (mentions.length > 10) {
-        const { botAdm, usrAdm } = await grupify(xp, m.key.remoteJid, m.key.participant || m.key.remoteJid)
-        
-        // Jangan tindak admin
+        const sender = m.sender || m.key?.participant || m.key?.remoteJid
+        const { botAdm, usrAdm } = await grupify(xp, chatId, sender)
         if (usrAdm) return 
 
         if (botAdm) {
-            // Hapus Pesan
-            await xp.sendMessage(m.key.remoteJid, { delete: m.key })
-            
-            // Kick User
-            await xp.groupParticipantsUpdate(m.key.remoteJid, [m.key.participant], 'remove')
-            
-            await xp.sendMessage(m.key.remoteJid, { 
-                text: `⚠️ *ANTI SPAM TAG* ⚠️\n\n@${m.key.participant.split('@')[0]} dikeluarkan karena melakukan spam tag (${mentions.length} user).`,
-                mentions: [m.key.participant]
+            await xp.sendMessage(chatId, { delete: m.key })
+            await xp.groupParticipantsUpdate(chatId, [sender], 'remove')
+            await xp.sendMessage(chatId, { 
+                text: `⚠️ *ANTI SPAM TAG* ⚠️\n\n@${sender.split('@')[0]} dikeluarkan karena melakukan spam tag (${mentions.length} user).`,
+                mentions: [sender]
             })
         }
+        return true
     }
   } catch (e) {
     console.error('Error checkSpamTag:', e)
@@ -128,27 +124,26 @@ export const checkSpamTag = async (m, xp) => {
 
 export const checkAntilink = async (m, xp) => {
   try {
-    if (!m.key.remoteJid.endsWith('@g.us')) return
+    const chatId = m.chat || m.key?.remoteJid
+    if (!m.isGroup && !chatId?.endsWith('@g.us')) return
     
-    // 1. Cek Fitur Aktif
-    const gcData = getGc({ id: m.key.remoteJid })
+    const gcData = getGc({ id: chatId })
     const isAntilink = gcData?.filter?.antilink
-    const isAntilinkGc = gcData?.filter?.antilinkgc // Strict Mode (Only Owner)
+    const isAntilinkGc = gcData?.filter?.antilinkgc
 
     if (!gcData || (!isAntilink && !isAntilinkGc)) return
 
-    // 2. Cek Konten Link
-    const text = (m.message?.conversation || m.message?.extendedTextMessage?.text || '').toLowerCase()
+    const text = (m.text || m.body || '').toLowerCase()
     const linkRegex = /chat\.whatsapp\.com\/[a-zA-Z0-9]{20,}/i
     
     if (!linkRegex.test(text)) return
 
-    // 3. Cek Status Admin & Owner
-    const { botAdm, usrAdm } = await grupify(xp, m.key.remoteJid, m.key.participant || m.key.remoteJid)
-    const senderNum = (m.key.participant || m.sender).split('@')[0]
+    const sender = m.sender || m.key?.participant || m.key?.remoteJid
+    const { botAdm, usrAdm } = await grupify(xp, chatId, sender)
+    const senderNum = sender.split('@')[0]
     const isOwner = [].concat(global.ownerNumber).map(n => n.replace(/[^0-9]/g, '')).includes(senderNum)
 
-    // Logika Pengecualian
+    if (isOwner) return
     if (isAntilinkGc) {
         // MODE STRICT: Hanya Owner yang boleh
         if (isOwner) return
@@ -157,28 +152,24 @@ export const checkAntilink = async (m, xp) => {
         if (usrAdm) return
     }
 
-    // 4. Eksekusi Hukuman (Jika Bot Admin)
     if (botAdm) {
-        // Hapus Pesan
-        await xp.sendMessage(m.key.remoteJid, { delete: m.key })
+        await xp.sendMessage(chatId, { delete: m.key })
         
-        // Kick User (Kecuali Admin, karena bot gak bisa kick admin)
         if (!usrAdm) {
-            await xp.groupParticipantsUpdate(m.key.remoteJid, [m.key.participant], 'remove')
+            await xp.groupParticipantsUpdate(chatId, [sender], 'remove')
         }
         
-        // Kirim Notif
-        await xp.sendMessage(m.key.remoteJid, { 
+        await xp.sendMessage(chatId, { 
             text: `⛔ *LINK TERDETEKSI* ⛔\n\nMaaf @${senderNum}, mengirim link grup lain dilarang di sini.`,
-            mentions: [m.key.participant]
+            mentions: [sender]
         })
     } else {
-        // Jika bot bukan admin, cuma bisa reply
-        await xp.sendMessage(m.key.remoteJid, { 
+        await xp.sendMessage(chatId, { 
             text: `⚠️ @${senderNum} Jangan kirim link grup!\n(Jadikan bot admin untuk auto-kick)`,
-            mentions: [m.key.participant]
+            mentions: [sender]
         }, { quoted: m })
     }
+    return true
 
   } catch (e) {
     console.error('Error checkAntilink:', e)
@@ -187,24 +178,32 @@ export const checkAntilink = async (m, xp) => {
 
 export const checkMute = async (m, xp) => {
     try {
-        if (!m.key.remoteJid.endsWith('@g.us')) return
+        const chatId = m.chat || m.key?.remoteJid
+        if (!m.isGroup && !chatId?.endsWith('@g.us')) return
         
-        const gcData = getGc({ id: m.key.remoteJid })
-        if (!gcData || !gcData.muteList || gcData.muteList.length === 0) return
+        const gcData = getGc({ id: chatId })
+        if (!gcData) return
 
-        // Normalisasi JID
-        const sender = m.key.participant || m.key.remoteJid
-        const isMuted = gcData.muteList.some(id => id.split('@')[0] === sender.split('@')[0])
-        
-        if (isMuted) {
-            const { botAdm, usrAdm } = await grupify(xp, m.key.remoteJid, sender)
+        const sender = m.sender || m.key?.participant || m.key?.remoteJid
+        const senderNum = sender.split('@')[0]
+        const isOwner = [].concat(global.ownerNumber || []).map(n => (n || '').toString().replace(/[^0-9]/g, '')).includes(senderNum)
+
+        // Group mute
+        if (gcData.mute && !isOwner) {
+            return true
+        }
+
+        // Individual mute list
+        if (gcData.muteList && gcData.muteList.length > 0) {
+            const isMuted = gcData.muteList.some(id => id.split('@')[0] === senderNum)
             
-            // Admin kebal mute
-            if (usrAdm) return
-
-            if (botAdm) {
-                // Hapus pesan
-                await xp.sendMessage(m.key.remoteJid, { delete: m.key })
+            if (isMuted) {
+                const { botAdm, usrAdm } = await grupify(xp, chatId, sender)
+                if (usrAdm) return
+                if (botAdm) {
+                    await xp.sendMessage(chatId, { delete: m.key })
+                }
+                return true
             }
         }
     } catch (e) {
@@ -214,20 +213,23 @@ export const checkMute = async (m, xp) => {
 
 export const checkAntibot = async (m, xp) => {
   try {
-    if (!m.key.remoteJid.endsWith('@g.us')) return
+    const chatId = m.chat || m.key?.remoteJid
+    if (!m.isGroup && !chatId?.endsWith('@g.us')) return
     
-    const gcData = getGc({ id: m.key.remoteJid })
+    const gcData = getGc({ id: chatId })
     if (!gcData || !gcData.filter?.antibot) return
 
-    if (m.key.id.startsWith('BAE5') && m.key.id.length === 16) {
-        const { botAdm, usrAdm } = await grupify(xp, m.key.remoteJid, m.key.participant)
-        if (usrAdm) return // Admin bots are safe
+    if (m.isBaileys) {
+        const sender = m.sender || m.key?.participant
+        const { botAdm, usrAdm } = await grupify(xp, chatId, sender)
+        if (usrAdm) return
 
         if (botAdm) {
-             await xp.sendMessage(m.key.remoteJid, { delete: m.key })
-             await xp.groupParticipantsUpdate(m.key.remoteJid, [m.key.participant], 'remove')
-             await xp.sendMessage(m.key.remoteJid, { text: `🤖 *ANTIBOT DETECTED* 🤖\n\nMaaf, bot lain dilarang disini.` })
+             await xp.sendMessage(chatId, { delete: m.key })
+             await xp.groupParticipantsUpdate(chatId, [sender], 'remove')
+             await xp.sendMessage(chatId, { text: `🤖 *ANTIBOT DETECTED* 🤖\n\nMaaf, bot lain dilarang disini.` })
         }
+        return true
     }
   } catch (e) {
       console.error('Error checkAntibot:', e)
@@ -236,18 +238,21 @@ export const checkAntibot = async (m, xp) => {
 
 export const checkAntisticker = async (m, xp) => {
   try {
-      if (!m.key.remoteJid.endsWith('@g.us')) return
+      const chatId = m.chat || m.key?.remoteJid
+      if (!m.isGroup && !chatId?.endsWith('@g.us')) return
       
-      const gcData = getGc({ id: m.key.remoteJid })
+      const gcData = getGc({ id: chatId })
       if (!gcData || !gcData.filter?.antisticker) return
       
       if (m.mtype === 'stickerMessage') {
-          const { botAdm, usrAdm } = await grupify(xp, m.key.remoteJid, m.key.participant)
-          if (usrAdm) return // Admin allowed
+          const sender = m.sender || m.key?.participant
+          const { botAdm, usrAdm } = await grupify(xp, chatId, sender)
+          if (usrAdm) return
           
           if (botAdm) {
-              await xp.sendMessage(m.key.remoteJid, { delete: m.key })
+              await xp.sendMessage(chatId, { delete: m.key })
           }
+          return true
       }
   } catch (e) {
       console.error('Error checkAntisticker:', e)
@@ -256,22 +261,25 @@ export const checkAntisticker = async (m, xp) => {
 
 export const checkAntiwame = async (m, xp) => {
   try {
-    if (!m.key.remoteJid.endsWith('@g.us')) return
+    const chatId = m.chat || m.key?.remoteJid
+    if (!m.isGroup && !chatId?.endsWith('@g.us')) return
     
-    const gcData = getGc({ id: m.key.remoteJid })
+    const gcData = getGc({ id: chatId })
     if (!gcData || !gcData.filter?.antiwame) return
 
-    const text = (m.message?.conversation || m.message?.extendedTextMessage?.text || '').toLowerCase()
+    const text = (m.text || m.body || '').toLowerCase()
     const linkRegex = /wa\.me\/\d+/i
     
     if (linkRegex.test(text)) {
-        const { botAdm, usrAdm } = await grupify(xp, m.key.remoteJid, m.key.participant)
-        if (usrAdm) return // Admin allowed
+        const sender = m.sender || m.key?.participant
+        const { botAdm, usrAdm } = await grupify(xp, chatId, sender)
+        if (usrAdm) return
 
         if (botAdm) {
-            await xp.sendMessage(m.key.remoteJid, { delete: m.key })
-            await xp.sendMessage(m.key.remoteJid, { text: `⚠️ @${m.key.participant.split('@')[0]} Link wa.me dilarang!`, mentions: [m.key.participant] })
+            await xp.sendMessage(chatId, { delete: m.key })
+            await xp.sendMessage(chatId, { text: `⚠️ @${sender.split('@')[0]} Link wa.me dilarang!`, mentions: [sender] })
         }
+        return true
     }
   } catch (e) {
       console.error('Error checkAntiwame:', e)

@@ -20,6 +20,13 @@ const normalizeJid = (jid) => {
     if (!jid) return jid
     const decoded = jidDecode(jid)
     if (typeof decoded !== 'string') return jid
+
+    // Resolve LID to phone number via lidReverseMap
+    if (decoded.endsWith('@lid') && global.lidReverseMap?.has(decoded)) {
+        const resolved = global.lidReverseMap.get(decoded)
+        if (resolved) return resolved.split('@')[0] + '@s.whatsapp.net'
+    }
+
     return decoded.toLowerCase()
 }
 
@@ -63,6 +70,8 @@ const MEDIA_TYPE_MAP = {
     viewOnceMessage: 'Sekali Lihat',
     viewOnceMessageV2: 'Sekali Lihat',
     interactiveMessage: 'Button',
+    richResponseMessage: 'Rich AI',
+    albumMessage: 'Album',
     ptvMessage: 'Ptv',
     questionMessage: 'Pertanyaan'
 }
@@ -167,7 +176,13 @@ function getMessageContent(m) {
   if (!media) {
       if (c.contactMessage) media = `Kontak ${c.contactMessage.displayName || ''}`
       else if (c.eventMessage) media = `Acara ${c.eventMessage.name || ''}`
-      else {
+      else if (global.xp?.detect) {
+          const detectedType = global.xp.detect(m)
+          if (detectedType && detectedType !== 'Unknown' && detectedType !== 'text') {
+              media = detectedType.charAt(0).toUpperCase() + detectedType.slice(1)
+          }
+      }
+      if (!media) {
           for (const key in MEDIA_TYPE_MAP) {
               if (c[key]) {
                   media = MEDIA_TYPE_MAP[key]

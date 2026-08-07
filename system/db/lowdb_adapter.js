@@ -11,7 +11,8 @@ const fileAdapters = {
     database: new JSONFile(join(__dirname, 'database.json')),
     dataGc: new JSONFile(join(__dirname, 'dataGc.json')),
     stats: new JSONFile(join(__dirname, 'stats.json')),
-    requests: new JSONFile(join(__dirname, 'requests.json'))
+    requests: new JSONFile(join(__dirname, 'requests.json')),
+    lid: new JSONFile(join(__dirname, 'lid.json'))
 };
 
 // Buat instance LowDB untuk setiap adapter
@@ -19,7 +20,8 @@ const dbs = {
     database: new Low(fileAdapters.database),
     dataGc: new Low(fileAdapters.dataGc),
     stats: new Low(fileAdapters.stats),
-    requests: new Low(fileAdapters.requests)
+    requests: new Low(fileAdapters.requests),
+    lid: new Low(fileAdapters.lid)
 };
 
 // Fungsi untuk memuat semua database

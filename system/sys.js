@@ -150,11 +150,18 @@ export const txtLeave = async (xp, chat) => {
   }
 }
 
-export const mode = async (xp, chatData) => {
+export const mode = (xp, chatData) => {
   if (!chatData) return !1
 
-  const senderNum = chatData.sender.replace(/\D/g, ''),
-        isOwner = (global.ownerNumber || []).map(v => v.replace(/\D/g, '')).includes(senderNum)
+  const sender = chatData.sender
+  const senderNum = sender.replace(/\D/g, ''),
+        ownerNum = (global.ownerNumber || []).map(v => v.replace(/\D/g, ''))
+
+  // Check LID reverse map for owner
+  const phoneFromLid = global.lidReverseMap?.get(sender) || null
+  const phoneFromLidNum = phoneFromLid ? phoneFromLid.split('@')[0] : null
+
+  const isOwner = ownerNum.includes(senderNum) || (phoneFromLidNum && ownerNum.includes(phoneFromLidNum))
 
   // Owner Selalu Lolos
   if (isOwner) return !0

@@ -2,7 +2,7 @@ import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 const { generateWAMessageContent, getContentType } = require('@adiwajshing/baileys');
 import { convertToOpus, generateWaveform } from '#system/ffmpeg.js'
-import { db, saveDb } from '#system/db/data.js'
+import { db, saveDb, markDirty } from '#system/db/data.js'
 import axios from 'axios'
 
 /**
@@ -141,29 +141,19 @@ Input Pengguna: ${text}`
 /**
  * Mendeteksi sinyal panggilan untuk Jarvis.
  */
-const signal = async (text, m, user, id, xp, ev) => {
-  const idBot = xp.user?.id?.split(':')[0] + '@s.whatsapp.net',
-        botName = 'jarvis',
-        botNumb = idBot.split('@')[0],
-        msg = m.message || {},
-        ctx = msg.extendedTextMessage?.contextInfo || msg.imageMessage?.contextInfo || {},
-        caption = msg.imageMessage?.caption 
-               || msg.videoMessage?.caption 
-               || text 
-               || '',
-        { mentionedJid = [], participant = '' } = ctx,
-        sender = m.key?.participant || m.participant || user,
-        senderBase = sender?.split(':')[0] || sender,
-        lowerText = caption.toLowerCase(),
-        call = [
-          mentionedJid.includes(idBot),
-          participant === idBot,
-          ctx.participant === idBot,
-          lowerText.includes('jarvis')
-        ].some(Boolean),
-        prefix = [].concat(global.prefix).some(p => lowerText.startsWith(p))
+const signal = async (text, m, user, id, xp, ev) => {    const idBot = xp.user?.id?.split(':')[0] + '@s.whatsapp.net',
+        ctx = (m.message?.extendedTextMessage || m.message?.imageMessage)?.contextInfo || {},
+        sender = m.sender || user,
+        lowerText = (text || '').toLowerCase(),
+        isGroup = id.endsWith('@g.us'),
+        isMentioned = m.mentionedJid?.includes(idBot) || (m.quoted && m.quoted.sender === idBot)
 
-  if ((call && senderBase === botNumb) || prefix || !call) return
+  const shouldTrigger = (!m.fromMe && !m.isBaileys && !m.isCommand && (
+      (isGroup && (isMentioned || lowerText.includes('jarvis'))) ||
+      (!isGroup && !isMentioned)
+  ))
+
+  if (!shouldTrigger) return
 
   const keyData = Object.values(db()?.key || {}).find(v => v?.jid === sender)
   

@@ -6,7 +6,12 @@ import {
     checkToxic, 
     checkAntilink, 
     checkMute, 
-    checkAutoDelete 
+    checkAutoDelete,
+    checkVirtext,
+    checkSpamTag,
+    checkAntibot,
+    checkAntisticker,
+    checkAntiwame
 } from './filter.js'
 import { checkAfk } from './afk.js'
 import { smsg } from './msg.js'
@@ -20,6 +25,36 @@ import {
     groupCache 
 } from './function.js'
 import { rct_key } from './reaction.js'
+
+function isDuplicate(chatId, msgId) {
+    if (!global.msgCacheSet) global.msgCacheSet = new Map()
+    if (!global.msgCacheLastSeen) global.msgCacheLastSeen = new Map()
+
+    const now = Date.now()
+
+    if (!global.msgCacheSet.has(chatId)) global.msgCacheSet.set(chatId, new Set())
+    global.msgCacheLastSeen.set(chatId, now)
+
+    const cache = global.msgCacheSet.get(chatId)
+    if (cache.has(msgId)) return true
+    cache.add(msgId)
+    return false
+}
+
+// Cleanup old caches every 60 seconds
+setInterval(() => {
+    const now = Date.now()
+    const expiry = 60000
+
+    if (global.msgCacheLastSeen && global.msgCacheSet) {
+        for (let [chatId, lastSeen] of global.msgCacheLastSeen.entries()) {
+            if (now - lastSeen > expiry) {
+                global.msgCacheSet.delete(chatId)
+                global.msgCacheLastSeen.delete(chatId)
+            }
+        }
+    }
+}, 60000)
 
 /**
  * Optimized Message Handler for FRIEREN-MD
@@ -37,12 +72,8 @@ export async function messageHandler(xp, { messages, type }) {
             m = cleanMsg(m)
             m = replaceLid(m)
 
-            const id = m.key.remoteJid
-            const isGroup = id.endsWith('@g.us')
-            const sender = isGroup ? (m.key.participant || m.participant) : id
-            
             // 2. Specialized Messages (Status & Reactions)
-            if (id === 'status@broadcast' && global.autoreadsw) {
+            if (m.key.remoteJid === 'status@broadcast' && global.autoreadsw) {
                 await xp.readMessages([m.key]); continue
             }
             
@@ -54,24 +85,28 @@ export async function messageHandler(xp, { messages, type }) {
             m = smsg(xp, m)
             if (!m) continue
 
-            const chatData = global.chat(m, global.botName)
-            if (!chatData) continue
-            const { pushName, channel, group } = chatData
-            
+            const id = m.chat
+            const isGroup = m.isGroup
+            const sender = m.sender
+            const pushName = m.pushName || m.name || (m.sender ? m.sender.split('@')[0] : '')
+
             // 4. Content Extraction
             const { text, media } = global.getMessageContent(m)
             if (text) { m.body = text; m.text = text }
 
-            // 5. Logging (Optimized)
+            // 5. Duplicate Detection
+            if (!m.fromMe && isDuplicate(id, m.key.id)) continue
+
+            // 6. Logging
             const time = global.time.timeIndo('Asia/Jakarta', 'HH:mm'),
                   name = pushName || sender.split('@')[0]
             
-            const groupMetadata = group ? (groupCache.get(id) || await getMetadata(id, xp) || {}) : {}
-            const groupName = group ? groupMetadata.subject || 'Grup' : ''
+            const groupMetadata = isGroup ? (groupCache.get(id) || await getMetadata(id, xp) || {}) : {}
+            const groupName = isGroup ? groupMetadata.subject || 'Grup' : ''
 
             console.log(
                 c.bgGrey.yellowBright.bold(
-                    group ? `[ ${groupName} | ${name} ]` : channel ? `[ ${id} ]` : `[ ${name} ]`
+                    isGroup ? `[ ${groupName} | ${name} ]` : id.endsWith('@newsletter') ? `[ ${id} ]` : `[ ${name} ]`
                 ) +
                 c.white.bold(' | ') +
                 c.blueBright.bold(`[ ${time} ]`)
@@ -85,15 +120,15 @@ export async function messageHandler(xp, { messages, type }) {
                 )
             }
 
-            // 6. Duplicate & Spam Filter
-            if (!(await filterMsg(m, chatData, text))) continue
+            // 7. Spam Filter
+            if (!(await filterMsg(m, { id, group: isGroup, sender, pushName, channel: id.endsWith('@newsletter') }, text))) continue
 
-            // --- ACTIVITY TRACKING (NEW) ---
+            // --- ACTIVITY TRACKING ---
             const user = db().key[sender]
             if (user) {
                 user.chatCount = (user.chatCount || 0) + 1
             }
-            if (group) {
+            if (isGroup) {
                 const gcData = getGc(id)
                 if (gcData) {
                     gcData.stats = gcData.stats || {}
@@ -113,18 +148,14 @@ export async function messageHandler(xp, { messages, type }) {
                 }, 600000) // 10 minutes TTL
             }
 
-            global.msgCache[id] = global.msgCache[id] || []
-            if (global.msgCache[id].includes(m.key.id)) continue
-            global.msgCache[id] = [...global.msgCache[id], m.key.id].slice(-7)
-
             if (global.autoread) xp.readMessages([m.key]).catch(() => {})
             
-            if (group && Object.keys(groupMetadata).length) { await saveLidCache(groupMetadata) }
+            if (isGroup && Object.keys(groupMetadata).length) { await saveLidCache(groupMetadata) }
 
-            // 7. Security Checks (Banned Groups/Users)
-            if (group && bangc({ id, group, sender, pushName, channel })) continue 
+            // 8. Security Checks (Banned Groups/Users)
+            if (isGroup && bangc({ id, group: isGroup, sender, pushName, channel: id.endsWith('@newsletter') })) continue 
 
-            // 8. Auto Response & Signals
+            // 9. Auto Response & Signals
             if (text && db().respon && db().respon[text.toLowerCase()]) {
                  await xp.sendMessage(id, { text: db().respon[text.toLowerCase()] }, { quoted: m })
             }
@@ -133,12 +164,17 @@ export async function messageHandler(xp, { messages, type }) {
                 signal(text, m, sender, id, xp, global.ev).catch(e => console.error('Signal Error:', e))
             }
 
-            // 9. Parallel Handlers (Non-Blocking)
+            // 10. Parallel Handlers (Non-Blocking)
             Promise.all([
                 checkAutoDelete(m, xp).catch(e => console.error('checkAutoDelete error:', e)),
                 checkToxic(m, xp).catch(e => console.error('checkToxic error:', e)),
+                checkVirtext(m, xp).catch(e => console.error('checkVirtext error:', e)),
+                checkSpamTag(m, xp).catch(e => console.error('checkSpamTag error:', e)),
                 checkAntilink(m, xp).catch(e => console.error('checkAntilink error:', e)),
                 checkMute(m, xp).catch(e => console.error('checkMute error:', e)),
+                checkAntibot(m, xp).catch(e => console.error('checkAntibot error:', e)),
+                checkAntisticker(m, xp).catch(e => console.error('checkAntisticker error:', e)),
+                checkAntiwame(m, xp).catch(e => console.error('checkAntiwame error:', e)),
                 checkAfk(m, xp).catch(e => console.error('checkAfk error:', e)),
                 handleCmd(m, xp, global.store).catch(e => console.error('handleCmd error:', e))
             ]);

@@ -6,7 +6,8 @@ import similarity from 'similarity'
 import { own } from '../system/helper.js'
 import { fileURLToPath } from 'url'
 import middleware from '../system/middleware.js'
-import { getGc, stats, saveDb, saveDbDebounced } from '../system/db/data.js'
+import getMessageContent from '../system/msg.js'
+import { getGc, stats, saveDb, saveDbDebounced, markDirty } from '../system/db/data.js'
 import { ocrs } from './ocrs.js'
 import { createRequire } from "module";
 
@@ -24,7 +25,9 @@ const pluginsDir = p.join(dirname, "plugins")
 class CommandEmitter extends EventEmitter {
   constructor() {
       super()
-      this.cmd = []
+      this.commands = new Map()
+      this.regexCommands = []
+      this.allPlugins = []
   }
   
   on(def) {
@@ -34,19 +37,37 @@ class CommandEmitter extends EventEmitter {
     def.cmd = def.cmd || def.command
     def.name = def.name || (Array.isArray(def.cmd) ? def.cmd[0] : undefined)
     
-    // Normalize cmd to Array or RegExp
-    if (typeof def.cmd === 'string') def.cmd = [def.cmd]
-    
-    // Push to store
-    this.cmd.push(def)
+    const cmdList = Array.isArray(def.cmd) ? def.cmd : [def.cmd]
+    cmdList.forEach(c => {
+        if (c instanceof RegExp) {
+            this.regexCommands.push({ ...def, regex: c })
+        } else {
+            this.commands.set(String(c).toLowerCase(), def)
+        }
+    })
+    this.allPlugins.push(def)
+  }
+
+  find(cmdStr, text) {
+      if (!cmdStr) return null
+      const lower = cmdStr.toLowerCase()
+
+      let found = this.commands.get(lower)
+      if (found) return found
+
+      return this.regexCommands.find(r => r.regex.test(lower) || r.regex.test(text))
   }
 }
 
 const ev = new CommandEmitter()
 
 const unloadByFile = file => {
-  if (!file || !ev.cmd) return
-  ev.cmd = ev.cmd.filter(x => x.file !== file)
+  if (!file) return
+  for (let [k, v] of ev.commands.entries()) {
+      if (v.file === file) ev.commands.delete(k)
+  }
+  ev.regexCommands = ev.regexCommands.filter(x => x.file !== file)
+  ev.allPlugins = ev.allPlugins.filter(x => x.file !== file)
 }
 
 const loadFile = async (rootDir, f, isReload = !0) => {
@@ -150,7 +171,7 @@ const loadAll = async () => {
   const plugins = getAllFiles(pluginsDir)
   for (const f of plugins) await loadFile(pluginsDir, f, !0)
 
-  console.log(c.greenBright.bgGrey.bold(`Berhasil memuat total ${ev.cmd.length} cmd`))
+  console.log(c.greenBright.bgGrey.bold(`Berhasil memuat total ${ev.allPlugins.length} cmd`))
 }
 
 const watch = () => {
@@ -179,13 +200,6 @@ const watch = () => {
   watchDir(pluginsDir)
 }
 
-let _allCmdsCache = null
-const getAllCmds = () => {
-    if (_allCmdsCache) return _allCmdsCache
-    _allCmdsCache = ev.cmd.flatMap(c => Array.isArray(c.cmd) ? c.cmd.filter(x => typeof x === 'string') : [])
-    return _allCmdsCache
-}
-
 const handleCmd = async (m, xp, store) => {
   let id;
   try {
@@ -194,7 +208,7 @@ const handleCmd = async (m, xp, store) => {
     if (m.message?.protocolMessage || m.message?.senderKeyDistributionMessage) return
 
     // --- 1. ENRICH MESSAGE OBJECT ---
-    const { text } = global.getMessageContent(m) || {}
+    const { text } = getMessageContent(m) || {}
     
     id = m.key.remoteJid 
     if (!id) return 
@@ -210,19 +224,8 @@ const handleCmd = async (m, xp, store) => {
     // --- OCR SYSTEM (NEW) ---
     if (await ocrs(xp, m)) return
 
-    // --- 3. FIND COMMAND DATA (STRICTER) ---
-    const eventData = ev.cmd?.find(e => {
-        // If it's a regex, it might not need a prefix
-        if (e.cmd instanceof RegExp) return e.cmd.test(cmdText) || e.cmd.test(lowerCmd)
-        if (Array.isArray(e.cmd)) {
-            return e.cmd.some(c => {
-                if (c instanceof RegExp) return c.test(cmdText) || c.test(lowerCmd)
-                // Only match if it's actually the command string
-                return c.toLowerCase() === lowerCmd
-            })
-        }
-        return false
-    })
+    // --- 3. FIND COMMAND DATA (FAST MAP LOOKUP) ---
+    const eventData = ev.find(lowerCmd, cmdText)
 
     // --- PREFIX VALIDATION (EARLY) ---
     // Identify if this is potentially a command
@@ -238,7 +241,7 @@ const handleCmd = async (m, xp, store) => {
     Object.defineProperty(m, 'isBotAdmin', { value: mw.data.isBotAdmin, enumerable: true, configurable: true, writable: true })
     
     // --- 5. EXECUTE 'BEFORE' HOOKS (Interceptors) ---
-    for (const plugin of ev.cmd) {
+    for (const plugin of ev.allPlugins) {
         if (typeof plugin.before === 'function') {
             try {
                 const stop = await plugin.before(m, { 
@@ -261,21 +264,21 @@ const handleCmd = async (m, xp, store) => {
     if (!lowerCmd) return
 
     // --- SIMILARITY CHECK (ONLY IF PREFIX USED) ---
-    if (!eventData && pre) {
+    if (!eventData && pre && pre !== '') {
         const gcData = getGc(id)
         if (gcData?.mute && !own(m)) return
-        const allCmds = getAllCmds()
-        const matches = allCmds.map(c => ({ name: c, score: similarity(lowerCmd, c) }))
-        const bestMatches = matches.filter(m => m.score > 0.5).sort((a, b) => b.score - a.score).slice(0, 3)
-        if (bestMatches.length > 0) {
-            let txt = `❓ *COMMAND TIDAK DITEMUKAN*\nMungkin maksud Anda:`
-            bestMatches.forEach((match, i) => {
-                txt += `\n${i+1}. *${usedPrefix}${match.name}* (${Math.floor(match.score * 100)}%)`
-            })
-            return xp.sendMessage(id, { text: txt }, { quoted: m })
+        const allCmds = Array.from(ev.commands.keys())
+        if (allCmds.length > 0) {
+            const matches = allCmds.map(c => ({ name: c, score: similarity(lowerCmd, c) }))
+            const bestMatches = matches.filter(m => m.score > 0.5).sort((a, b) => b.score - a.score).slice(0, 3)
+            if (bestMatches.length > 0) {
+                let txt = `❓ *COMMAND TIDAK DITEMUKAN*\nMungkin maksud Anda:`
+                bestMatches.forEach((match, i) => {
+                    txt += `\n${i+1}. *${usedPrefix}${match.name}* (${Math.floor(match.score * 100)}%)`
+                })
+                return xp.sendMessage(id, { text: txt }, { quoted: m })
+            }
         }
-        
-        // Fallback: If prefix used but no match at all
         return m.reply(`❌ *COMMAND TIDAK DIKENAL*\n\nKetik *${usedPrefix}menu* untuk melihat daftar fitur.`)
     }
 
@@ -284,7 +287,7 @@ const handleCmd = async (m, xp, store) => {
 
     // --- PREFIX VALIDATION (STRICT) ---
     let needPrefix = eventData.prefix ?? true
-    const isRegex = eventData.cmd instanceof RegExp || (Array.isArray(eventData.cmd) && eventData.cmd.some(c => c instanceof RegExp))
+    const isRegex = eventData.regex || eventData.cmd instanceof RegExp
     if (isRegex && eventData.prefix === undefined) needPrefix = false
     
     if (needPrefix === true && !pre) return
@@ -343,7 +346,7 @@ const handleCmd = async (m, xp, store) => {
             dbStats.plugin[lowerCmd].total += 1
             dbStats.plugin[lowerCmd].success += 1
             dbStats.plugin[lowerCmd].last = Date.now()
-            saveDbDebounced()
+            markDirty('stats')
         } catch {}
 
     } catch (e) {
@@ -370,8 +373,9 @@ const handleCmd = async (m, xp, store) => {
 // REMOVED TOP-LEVEL AWAIT TO PREVENT HANG DURING IMPORT
 
 global.reloadPlugins = async () => {
-    ev.cmd = []
-    _allCmdsCache = null
+    ev.commands.clear()
+    ev.regexCommands = []
+    ev.allPlugins = []
     await loadAll()
     return true
 }
