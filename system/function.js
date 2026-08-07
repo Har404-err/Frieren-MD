@@ -6,7 +6,7 @@ const require = createRequire(import.meta.url);
 const { prepareWAMessageMedia, generateWAMessageFromContent, generateWAMessage, proto } = require('@adiwajshing/baileys');
 import { jarvis } from '../cmd/interactive.js'
 import { tmpFiles } from './tmpfiles.js'
-import { db, saveDb } from './db/data.js'
+import { db, saveDb, lid, markDirty } from './db/data.js'
 
 const memoryCache = {},
       groupCache = new Map()
@@ -501,6 +501,79 @@ async function filterMsg(m, chat, text) {
   return !0
 }
 
+// --- ADMIN & OWNER VALIDATION HELPERS ---
+
+const { areJidsSameUser } = require('@adiwajshing/baileys');
+
+function getAdminStatus(participants, jid) {
+    if (!Array.isArray(participants) || !jid) return false;
+    const normalize = (id) => id && typeof id === 'string' ? id.split(':')[0] : id;
+    const targetJid = normalize(jid);
+    const targetNum = targetJid.split('@')[0];
+
+    let pn = targetJid;
+    let lidId = targetJid;
+    if (global.lidReverseMap) {
+        for (let [l, p] of global.lidReverseMap.entries()) {
+            if (p === targetJid || p === targetNum || p?.split('@')[0] === targetNum) { lidId = l; break; }
+        }
+        if (targetJid.endsWith('@lid')) {
+            pn = global.lidReverseMap.get(targetJid) || targetJid;
+        }
+    }
+
+    const checkSame = (id1, id2) => {
+        if (!id1 || !id2) return false;
+        if (typeof areJidsSameUser === 'function') {
+            try { if (areJidsSameUser(id1, id2)) return true; } catch {}
+        }
+        const n1 = id1.split('@')[0].split(':')[0];
+        const n2 = id2.split('@')[0].split(':')[0];
+        return n1 === n2;
+    };
+
+    const participant = participants.find(p => {
+        if (!p || !p.id) return false;
+        return checkSame(p.id, targetJid) ||
+               checkSame(p.id, pn) ||
+               checkSame(p.id, lidId) ||
+               (p.phoneNumber && checkSame(p.phoneNumber, pn)) ||
+               (p.lid && checkSame(p.lid, lidId));
+    });
+    return !!(participant?.admin || participant?.isSuperAdmin);
+}
+
+async function getPn(jid, xp) {
+    if (!jid) return null;
+
+    if (jid.endsWith('@s.whatsapp.net')) return jid.split('@')[0].split(':')[0];
+
+    const user = db().key[jid];
+    if (user?.pn) return String(user.pn).replace(/[^0-9]/g, '');
+
+    if (jid.endsWith('@lid') && global.lidReverseMap?.has(jid)) {
+        const resolved = global.lidReverseMap.get(jid);
+        if (resolved) return resolved.split('@')[0].split(':')[0];
+    }
+
+    const mapping = lid().key[jid];
+    if (mapping) return mapping.split('@')[0].split(':')[0];
+
+    return null;
+}
+
+function getLid(jid) {
+    const user = db().key[jid];
+    if (user?.lid) return user.lid;
+
+    if (jid.endsWith('@s.whatsapp.net') && global.lidReverseMap) {
+        for (let [l, p] of global.lidReverseMap.entries()) {
+            if (p === jid) return l;
+        }
+    }
+    return jid;
+}
+
 export {
   getMetadata,
   replaceLid,
@@ -520,5 +593,8 @@ export {
   handleApiError,
   filterMsg,
   _imgTmp,
-  _tax
+  _tax,
+  getAdminStatus,
+  getPn,
+  getLid
 }

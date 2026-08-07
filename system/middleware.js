@@ -1,6 +1,6 @@
-import { db, saveDb, saveDbDebounced, authUser, authGc, getGc } from './db/data.js'
+import { db, saveDb, saveDbDebounced, authUser, authGc, getGc, lid, markDirty } from './db/data.js'
 import { normalizeJid } from './msg.js'
-import { groupCache } from './function.js'
+import { groupCache, getAdminStatus, getPn } from './function.js'
 import moment from 'moment-timezone'
 
 /**
@@ -10,27 +10,47 @@ export default async function middleware(xp, m, cmd, eventData) {
     const result = { next: true, data: {} }
     
     // --- 1. PREPARE DATA ---
+    // Load LID mappings from database if not already in memory
+    if (!global.lidReverseMap || (global.lidReverseMap.size === 0 && Object.keys(lid()?.key || {}).length > 0)) {
+        global.lidReverseMap = new Map(Object.entries(lid().key))
+    }
+
     const botIdRaw = xp.user.id.includes(':') ? xp.user.id.split(':')[0] + '@s.whatsapp.net' : xp.user.id
     const botId = normalizeJid(botIdRaw)
     
     // STRICT DETECTION
     const remoteJid = m.key.remoteJid
     const isGroup = remoteJid.endsWith('@g.us')
-    const isPrivate = remoteJid.endsWith('@s.whatsapp.net')
+    const isPrivate = remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@lid')
     
-    let sender = isGroup ? (m.key.participant || m.participant) : remoteJid
-    sender = normalizeJid(sender || '')
-    
-    // DEBUG LOG
-    if (isPrivate) console.log(`[MW] PC Message from: ${sender} | Cmd: ${cmd}`)
+    let isOwner = false
+    let isCreator = false
+    let isAdmin = false
+    let isBotAdmin = false
 
-    // Owner Check (Early)
-    const senderNum = sender.split('@')[0]
+    let sender = m.sender || (isGroup ? (m.key.participant || m.participant) : remoteJid)
+    sender = normalizeJid(sender || '')
+
+    // Owner Check (Early) — strip device suffix and resolve LID
+    const senderNum = sender.split('@')[0].split(':')[0]
     const ownerNum = Array.isArray(global.ownerNumber)
         ? global.ownerNumber.map(n => n.replace(/[^0-9]/g, ''))
         : [global.ownerNumber?.replace(/[^0-9]/g, '')]
-    const isOwner = ownerNum.includes(senderNum)
-    const isCreator = senderNum === ownerNum[0]
+
+    // Resolve LID to phone number
+    let phoneFromLid = await getPn(sender, xp)
+    if (!phoneFromLid && sender.endsWith('@lid') && global.lidReverseMap?.has(sender)) {
+        phoneFromLid = global.lidReverseMap.get(sender)
+    }
+    const phoneFromLidNum = phoneFromLid ? phoneFromLid.replace(/[^0-9]/g, '') : null
+
+    isOwner = m.key.fromMe ||
+              ownerNum.includes(senderNum) ||
+              (phoneFromLidNum && ownerNum.includes(phoneFromLidNum))
+
+    isCreator = m.key.fromMe ||
+                senderNum === ownerNum[0] ||
+                (phoneFromLidNum && phoneFromLidNum === ownerNum[0])
 
     // --- 1.1 IGNORE OTHER BOTS (Anti-Loop & Anti-Spam) ---
     const isBotMsg = m.key.id.startsWith('BAE5') || m.key.id.startsWith('AR')
@@ -65,11 +85,26 @@ export default async function middleware(xp, m, cmd, eventData) {
     if (targetJid) targetJid = normalizeJid(targetJid)
     m.targetJid = targetJid
 
-    // Declare here to be safe across all scopes
-    let isAdmin = false
-    let isBotAdmin = false
-
     // Data Awal
+    const isCommandValid = eventData && (eventData.cmd || eventData.command)
+    const tags = eventData?.tags
+    let isRpgCmd = false
+    let isEconomyCmd = false
+    let isAiCmd = false
+    if (Array.isArray(tags)) {
+        isRpgCmd = tags.some(t => t.toLowerCase().includes('rpg'))
+        isEconomyCmd = tags.some(t => t.toLowerCase().includes('economy'))
+        isAiCmd = tags.some(t => t.toLowerCase().includes('ai'))
+    } else if (typeof tags === 'string') {
+        isRpgCmd = tags.toLowerCase().includes('rpg')
+        isEconomyCmd = tags.toLowerCase().includes('economy')
+        isAiCmd = tags.toLowerCase().includes('ai')
+    }
+    if (!isAiCmd && (eventData?.category?.toLowerCase() === 'ai' || eventData?.file?.includes('/ai/'))) {
+        isAiCmd = true
+    }
+    m.isAiResponse = isAiCmd
+
     result.data = {
         chat: global.chat(m),
         text: m.text || '',
@@ -80,7 +115,9 @@ export default async function middleware(xp, m, cmd, eventData) {
         isOwner,
         isCreator,
         isAdmin: false,
-        isBotAdmin: false
+        isBotAdmin: false,
+        isRpgCmd,
+        isEconomyCmd
     }
 
     // --- 2. GROUP METADATA (HANYA JIKA GRUP) ---
@@ -123,22 +160,14 @@ export default async function middleware(xp, m, cmd, eventData) {
                 }
 
                 const participants = groupMetadata.participants || []
-                const checkAdmin = (id) => {
-                    if (!id) return false
-                    const normalizedId = normalizeJid(id).split('@')[0]
-                    return participants.some(p => {
-                        const pId = normalizeJid(p.id || p.jid).split('@')[0]
-                        return pId === normalizedId && (p.admin === 'admin' || p.admin === 'superadmin')
-                    })
-                }
 
-                isAdmin = checkAdmin(sender)
-                isBotAdmin = checkAdmin(botId)
+                isAdmin = getAdminStatus(participants, sender) || getAdminStatus(participants, m.jid)
+                isBotAdmin = getAdminStatus(participants, botId)
 
                 result.data.groupMetadata = groupMetadata
                 result.data.participants = participants
                 result.data.groupName = groupMetadata.subject
-                result.data.isAdmin = isAdmin || isOwner // Owner is always admin
+                result.data.isAdmin = isAdmin
                 result.data.isBotAdmin = isBotAdmin
             } else {
                 // Fallback: If metadata fails, we still want to allow basic commands
@@ -154,20 +183,45 @@ export default async function middleware(xp, m, cmd, eventData) {
                 return { next: false }
             }
             
-            if (eventData?.admin && !isAdmin) {
-                if (!isOwner) {
-                    if (!groupMetadata) {
-                        await m.reply('⚠️ Gagal memverifikasi status Admin (Gangguan Koneksi). Coba lagi nanti.')
-                    } else {
-                        await m.reply(`❌ Perintah *${cmd}* ini khusus Admin Grup!`)
-                    }
-                    return { next: false }
+            if (eventData?.admin && !isAdmin && !isOwner) {
+                if (!groupMetadata) {
+                    await m.reply('⚠️ Gagal memverifikasi status Admin (Gangguan Koneksi). Coba lagi nanti.')
+                } else {
+                    await m.reply(`❌ Perintah *${cmd}* ini khusus Admin Grup!`)
                 }
+                return { next: false }
             }
+
+            if (eventData?.botAdmin && !isBotAdmin) {
+                await m.reply('❌ Bot harus jadi Admin grup untuk menggunakan perintah ini.')
+                return { next: false }
+            }
+
+            // Group ban check
+            const gcData = getGc(m.key.remoteJid)
+            if (isCommandValid && gcData?.ban && !isOwner) {
+                await m.reply('⛔ Grup ini telah di-banned oleh Owner Bot.')
+                return { next: false }
+            }
+            // Blacklist check
+            if (gcData?.blacklist?.includes(sender)) {
+                if (isBotAdmin) {
+                    try {
+                        await xp.sendMessage(m.key.remoteJid, { text: `⛔ @${sender.split('@')[0]} ada di blacklist!`, mentions: [sender] })
+                        await xp.groupParticipantsUpdate(m.key.remoteJid, [sender], 'remove')
+                    } catch {}
+                }
+                return { next: false }
+            }
+            // Blocked commands per-group
+            if (gcData?.cmdBlocked?.includes(cmd) && !isAdmin && !isOwner) {
+                await m.reply(`⛔ Command *${cmd}* telah diblokir di grup ini oleh Admin.`)
+                return { next: false }
+            }
+            // Owner-only filter
+            if (gcData?.filter?.owneronly && !isOwner) return { next: false }
             
             // --- 4. GROUP FEATURE TOGGLE CHECK ---
-            const gcData = getGc(m.key.remoteJid)
-            
             if (gcData?.staySchedule && isBotAdmin) {
                 const now = moment().tz('Asia/Jakarta')
                 const currentTime = now.format('HH:mm')
@@ -210,14 +264,50 @@ export default async function middleware(xp, m, cmd, eventData) {
                 }
             }
 
-            const tags = eventData?.tags
-            let isRpgCmd = false
-            if (Array.isArray(tags)) isRpgCmd = tags.some(t => t.toLowerCase() === 'rpg' || t.toLowerCase() === 'rpg crime')
-            else if (typeof tags === 'string') isRpgCmd = tags.toLowerCase().includes('rpg')
-
             if (gcData && typeof gcData.rpg !== 'undefined' && !gcData.rpg && isRpgCmd) {
                 await m.reply('⛔ *Fitur RPG Dinonaktifkan di Grup Ini.*')
                 return { next: false }
+            }
+
+            // --- BOT CLOCK (Group Sleep Mode) ---
+            const botClock = gcData?.botClock || db().settings?.botClock
+            if (isCommandValid && botClock && !isOwner && !isAdmin) {
+                const { close, open } = botClock
+                if (close && open) {
+                    const now = moment().tz('Asia/Jakarta')
+                    const currentTime = now.format('HH:mm')
+                    let isClosed = false
+                    if (close < open) {
+                        isClosed = (currentTime >= close && currentTime < open)
+                    } else {
+                        isClosed = (currentTime >= close || currentTime < open)
+                    }
+                    if (isClosed) {
+                        await m.reply(`💤 *BOT SLEEP MODE (GRUP)* 💤\n\nBot sedang tidak aktif untuk penggunaan di dalam Grup.\nJam Operasional Grup: *${open} - ${close} WIB*\n\nSilakan gunakan kembali pada jam operasional aktif.`)
+                        return { next: false }
+                    }
+                }
+            }
+
+            // --- SLOWMODE ---
+            if (gcData?.slowmode?.enabled && !isAdmin && !isOwner) {
+                try {
+                    const { checkSlowmode } = await import('../cmd/command/group/slowmode.js').catch(() => ({ checkSlowmode: null }))
+                    if (checkSlowmode) {
+                        const smResult = checkSlowmode(m, gcData, isCommandValid)
+                        if (smResult) {
+                            if (smResult.mode === 'all') {
+                                if (isBotAdmin) {
+                                    try { await xp.sendMessage(m.chat, { delete: m.key }) } catch {}
+                                }
+                                return { next: false }
+                            } else if (smResult.mode === 'onlycommand' && isCommandValid) {
+                                await m.reply(`🐢 *SLOWMODE AKTIF*\n\nMaaf, silakan tunggu *${smResult.remaining} detik* lagi sebelum menggunakan perintah.`)
+                                return { next: false }
+                            }
+                        }
+                    }
+                } catch {}
             }
 
         } catch (e) {
@@ -230,6 +320,14 @@ export default async function middleware(xp, m, cmd, eventData) {
         if (eventData?.group && !isOwner) {
             await m.reply('❌ Fitur ini khusus untuk Grup!')
             return { next: false }
+        }
+        // RPG & Economy commands only work in groups
+        if ((isRpgCmd || isEconomyCmd) && !isOwner) {
+            const allowed = ['me', 'profile', 'dompet', 'wallet', 'ceklimit', 'buy', 'shop', 'toko']
+            if (!allowed.includes(cmd)) {
+                await m.reply(`❌ Fitur *${(isRpgCmd ? 'RPG' : 'EKONOMI')}* hanya dapat dimainkan di dalam Grup!`)
+                return { next: false }
+            }
         }
     }
 
@@ -284,9 +382,9 @@ export default async function middleware(xp, m, cmd, eventData) {
         saveDbDebounced()
     }
     
+    
     // Validasi Limit (TANPA MENGURANGI DI SINI)
-    // Pastikan ini command valid sebelum cek limit
-    const isCommandValid = eventData && (eventData.cmd || eventData.command)
+    // isCommandValid already computed above
 
     // --- CHECK BANNED STATUS (ONLY IF COMMAND) ---
     if (isCommandValid && user?.ban && !isOwner) {
@@ -395,9 +493,21 @@ export default async function middleware(xp, m, cmd, eventData) {
         }
     }
 
-    // --- 7. XP & LEVEL SYSTEM ---
-    if (user) {
+    // --- 7. CHAT COUNT & XP SYSTEM ---
+    if (user && !m.key.fromMe && m.text) {
         user.lastSeen = Date.now()
+
+        // Chat count: +1 limit every 15 messages in group
+        if (isGroup) {
+            user.chatCount = (user.chatCount || 0) + 1
+            if (user.chatCount >= 15) {
+                user.chatCount = 0
+                if (user.limit !== Infinity) {
+                    user.limit = (user.limit || 0) + 1
+                    saveDbDebounced()
+                }
+            }
+        }
 
         try {
             if (typeof user.level !== 'number' || user.level < 1) user.level = 1
